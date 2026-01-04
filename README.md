@@ -12,7 +12,8 @@ A production-grade volatility surface modeling and option pricing library.
 ## Author
 
 Rohith Kumar
-MS Financial Engineering, Rutgers University
+Numerix
+MS Quantitative Finance, Rutgers University
 
 ## License
 
