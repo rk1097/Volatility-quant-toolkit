@@ -13,7 +13,7 @@ A production-grade volatility surface modeling and option pricing library.
 
 Rohith Kumar,
 Numerix,
-MS Quantitative Finance, Rutgers University
+MS Quantitative Finance-Rutgers University
 
 ## License
 
