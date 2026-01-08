@@ -1,7 +1,14 @@
+import warnings
 from volquant.models import black_scholes
 import numpy as np
 import math
+from enum import Enum
+from scipy.optimize import brentq
 
+class SolverMethod(Enum):
+    NEWTON = "newton"
+    BISECTION = "bisection"
+    BRENT = "brent"
 def validate_price(S : float , K : float , r : float , T : float , option_type : black_scholes.OptionType,q:float,price : float)-> None:
     if option_type == black_scholes.OptionType.CALL:
         intrinsic_value = max(S*np.exp(-q*T) - K*np.exp(-r*T),0.0)
@@ -32,7 +39,7 @@ def initial_guess(S :float , K : float , r : float , T : float , price : float):
 
     return np.median(guesses)
 
-def implied_vol_newton(S : float , K : float , r : float , T : float,option_type : black_scholes.OptionType, price : float,sigma_init : float = None , q : float = 0.0,tolerance : float = 1e-8,max_iterations :int = 50) -> float:
+def implied_vol_newton(S : float , K : float , r : float , T : float,option_type : black_scholes.OptionType, price : float , q : float = 0.0,tolerance : float = 1e-8,max_iterations :int = 50,sigma_init : float = None) -> float:
     validate_price(S , K , r , T , option_type , q , price)
     if sigma_init is None:
         vol = initial_guess(S,K,r,T,price)
@@ -61,6 +68,70 @@ def implied_vol_newton(S : float , K : float , r : float , T : float,option_type
         iterations += 1
 
     raise ValueError(f"The Newtons Method didnot converge in {iterations-1} iterations")
+
+
+def implied_vol_bisection(S : float , K : float , r : float , T : float , option_type : black_scholes.OptionType,price : float, q : float = 0.0, tolerance : float = 1e-8 , max_iterations : int = 50,sigma_low : float = 0.01,sigma_high : float =5.0 )->float:
+
+    validate_price(S , K , r , T , option_type , q , price)
+    if sigma_low <= 0 or sigma_high <= 0 or sigma_low >= sigma_high:
+        raise ValueError(f"Invalid initial volatility bracket [{sigma_low}, {sigma_high}]")
+
+    f_low = black_scholes.Blackscholes_price(S,K,r , T , sigma_low ,option_type,q)-price
+    f_high = black_scholes.Blackscholes_price(S,K,r,T,sigma_high,option_type,q)-price 
+
+    if f_low*f_high >  0:
+        raise ValueError(f"The given value range [{sigma_low},{sigma_high} doesnt contain the root")
+
+    for i in range(max_iterations):
+        sigma_mid = (sigma_low + sigma_high)/2
+        f_mid = black_scholes.Blackscholes_price(S, K , r , T ,sigma_mid,option_type,q)-price
+
+        if abs(f_mid) < tolerance:
+            return sigma_mid 
+
+        if f_mid*f_low < 0:
+            sigma_high = sigma_mid
+            f_high = f_mid
+
+        else:
+            sigma_low = sigma_mid
+            f_low = f_mid
+
+    raise ValueError(f"The bisection method didnot converge in {max_iterations} iteraions")
+
+def implied_vol_brent(S : float , K : float , r : float , T : float , option_type : black_scholes.OptionType,price : float, q : float = 0.0, tolerance : float = 1e-8,sigma_low = 1e-4,sigma_high=5.0 )->float:
+    validate_price(S,K,r,T, option_type,q , price)
+
+    def objective(sigma):
+        return black_scholes.Blackscholes_price(S,K,r,T,sigma,option_type,q) - price
+
+    try:
+        return brentq(objective,sigma_low,sigma_high,xtol = tolerance)
+
+    except Exception as e:
+        raise ValueError("Brents Method failed") from e
+
+
+
+
+
+def implied_vol(S : float , K : float , r : float , T : float , option_type : black_scholes.OptionType,price : float, q : float = 0.0, tolerance : float = 1e-8 , max_iterations : int = 50,method:str|SolverMethod = SolverMethod.BRENT)->float:
+    if isinstance(method,str):
+        method = SolverMethod(method.lower())
+
+    if method == SolverMethod.NEWTON:
+        return implied_vol_newton(S,K,r,T,option_type,price,q,tolerance,max_iterations)
+
+    if method == SolverMethod.BISECTION:
+        return implied_vol_bisection(S,K,r ,T , option_type , price , q , tolerance , max_iterations)
+
+    if method == SolverMethod.BRENT:
+        return implied_vol_brent(S , K , r , T , option_type , price , q ,tolerance)
+
+
+
+    
+
 
 
 
