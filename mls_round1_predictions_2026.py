@@ -2,65 +2,73 @@
 """
 MLS 2026 Round 1 Match Predictions
 ====================================
-Predicts outcomes for MLS Opening Weekend (February 21-22, 2026)
-using an Elo rating system calibrated on 2022-2025 MLS seasons.
+Predicts outcomes AND Over/Under 2.5 goals for MLS Opening Weekend
+(February 21-22, 2026) using two complementary models.
 
-Methodology
------------
-1. Elo ratings are computed from each team's final points tally
-   across the 2022-2025 regular seasons.
-2. Recent seasons are weighted more heavily (exponential decay).
-3. A home-field advantage of +100 Elo points is applied.
-4. Three-way win/draw/loss probabilities are derived from the
-   Elo differential, with MLS-calibrated draw rate (~22.5%).
-5. Off-season roster changes are approximated by a 30% regression
-   toward the league mean (1500) each year.
+Models
+------
+1. **Elo Model** — predicts home-win / draw / away-win probabilities.
+   Calibrated from 2022-2025 final regular-season points.
+
+2. **Poisson Goal Model** — predicts expected goals and P(Over 2.5).
+   Uses each team's 2025 goals-for / goals-against per game as
+   attack / defense strength ratings, then applies a Dixon-Coles style
+   independent Poisson approximation to get total-goal distributions.
+
+Both models apply a regression-to-mean to account for off-season
+roster changes and the general uncertainty at season start.
 
 Data Sources
 ------------
-- 2025 MLS Final Standings: Inter Miami CF won MLS Cup (3-1 vs Vancouver).
-  Philadelphia Union won the Supporters' Shield with 66 pts.
-- 2024 MLS Final Standings: LA Galaxy won MLS Cup; Inter Miami won Shield.
-- 2023 MLS Final Standings: Columbus Crew won MLS Cup.
-- 2022 MLS Final Standings: LAFC won MLS Cup.
+- 2025 MLS Final Standings (GF/GA, all 30 teams):
+    Eastern: Philadelphia Union 57/35, FC Cincinnati 52/40,
+    Inter Miami 81/55, Charlotte 55/46, NYCFC 50/44, Nashville 58/45,
+    Columbus 55/51, Chicago Fire 68/60, Orlando 63/51, NYRB 48/47,
+    NE Rev 44/51, Toronto 37/44, Montréal 34/60, Atlanta 38/63, DC 30/66.
+    Western: San Diego 64/41, Vancouver 66/38, LAFC 65/40,
+    Minnesota 56/39, Seattle 58/48, Austin 37/45, FC Dallas 52/55,
+    Portland 41/48, RSL 38/49, San Jose 60/63, Colorado 44/56,
+    Houston 43/56, St. Louis 44/58, LA Galaxy 46/66, Sporting KC 46/70.
+- 2025 MLS Cup: Inter Miami 3-1 Vancouver; Supporters' Shield: Philadelphia Union
+- 2024 MLS Cup: LA Galaxy 2-1 NYRB; Supporters' Shield: Inter Miami (74 pts)
+- 2023 MLS Cup: Columbus Crew; 2022 MLS Cup: LAFC
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 
 # ─────────────────────────────────────────────────────────────
-#  Model Configuration
+#  Shared Configuration
 # ─────────────────────────────────────────────────────────────
 
 INITIAL_ELO: float = 1500.0
-HOME_ADVANTAGE: float = 100.0   # Elo points added to home team
-K_SEASON: float = 40.0          # K-factor for season-level Elo update
-REGRESSION_TO_MEAN: float = 0.30  # Off-season mean-reversion factor
-DRAW_BASE_RATE: float = 0.225    # MLS historical draw rate ~22-23%
-DRAW_SENSITIVITY: float = 0.12   # Extra draw probability when sides are even
-ELO_SCALE: float = 400.0         # Standard Elo scale constant
+HOME_ADVANTAGE: float = 100.0    # Elo points added to home team
+K_SEASON: float = 40.0
+REGRESSION_TO_MEAN: float = 0.30
+DRAW_BASE_RATE: float = 0.225
+DRAW_SENSITIVITY: float = 0.12
+ELO_SCALE: float = 400.0
 
-# Season weights: more recent seasons matter more
-SEASON_WEIGHTS: Dict[int, float] = {
-    2022: 0.10,
-    2023: 0.15,
-    2024: 0.25,
-    2025: 0.50,
-}
+SEASON_WEIGHTS: Dict[int, float] = {2022: 0.10, 2023: 0.15, 2024: 0.25, 2025: 0.50}
 
-MLS_AVG_POINTS: float = 47.5     # Historical league-average points per 34-game season
-POINTS_TO_ELO_SCALE: float = 4.5  # 10 pts above avg ≈ +45 Elo
+MLS_AVG_POINTS: float = 47.5
+POINTS_TO_ELO_SCALE: float = 4.5
+
+# Poisson / goal model parameters
+LEAGUE_HOME_AVG: float = 1.60   # MLS home team avg goals/game
+LEAGUE_AWAY_AVG: float = 1.30   # MLS away team avg goals/game
+LEAGUE_AVG_GPG: float = 1.45    # Per-team average (total/2 teams per game)
+GOAL_REGRESSION: float = 0.25   # Off-season regression for attack/defense
 
 
 # ─────────────────────────────────────────────────────────────
-#  Historical Season Data (points, games_played)
+#  Historical Season Points (for Elo model)
 # ─────────────────────────────────────────────────────────────
 
 HISTORICAL_SEASONS: Dict[int, Dict[str, Tuple[int, int]]] = {
     2022: {
-        # Eastern Conference
         "Philadelphia Union":     (71, 34),
         "New York City FC":       (62, 34),
         "New York Red Bulls":     (59, 34),
@@ -76,8 +84,7 @@ HISTORICAL_SEASONS: Dict[int, Dict[str, Tuple[int, int]]] = {
         "FC Cincinnati":          (37, 34),
         "Toronto FC":             (33, 34),
         "Inter Miami CF":         (27, 34),
-        # Western Conference
-        "LAFC":                   (77, 34),  # MLS Cup winners
+        "LAFC":                   (77, 34),
         "Austin FC":              (62, 34),
         "FC Dallas":              (59, 34),
         "Sporting Kansas City":   (58, 34),
@@ -90,17 +97,15 @@ HISTORICAL_SEASONS: Dict[int, Dict[str, Tuple[int, int]]] = {
         "Minnesota United FC":    (44, 34),
         "Vancouver Whitecaps FC": (40, 34),
         "San Jose Earthquakes":   (36, 34),
-        # St. Louis City SC debuted in 2023
     },
     2023: {
-        # Eastern Conference
-        "FC Cincinnati":          (73, 34),  # Supporters' Shield
+        "FC Cincinnati":          (73, 34),
         "Philadelphia Union":     (65, 34),
-        "Inter Miami CF":         (58, 34),  # Messi arrived mid-season
+        "Inter Miami CF":         (58, 34),
         "Orlando City SC":        (57, 34),
         "Nashville SC":           (56, 34),
         "New York Red Bulls":     (52, 34),
-        "Columbus Crew":          (50, 34),  # MLS Cup winners
+        "Columbus Crew":          (50, 34),
         "Charlotte FC":           (50, 34),
         "New York City FC":       (49, 34),
         "Chicago Fire FC":        (48, 34),
@@ -109,7 +114,6 @@ HISTORICAL_SEASONS: Dict[int, Dict[str, Tuple[int, int]]] = {
         "D.C. United":            (39, 34),
         "Toronto FC":             (36, 34),
         "CF Montréal":            (32, 34),
-        # Western Conference
         "FC Dallas":              (63, 34),
         "LA Galaxy":              (60, 34),
         "LAFC":                   (60, 34),
@@ -123,11 +127,10 @@ HISTORICAL_SEASONS: Dict[int, Dict[str, Tuple[int, int]]] = {
         "Vancouver Whitecaps FC": (46, 34),
         "Minnesota United FC":    (44, 34),
         "San Jose Earthquakes":   (43, 34),
-        "St. Louis City SC":      (39, 34),  # Debut season
+        "St. Louis City SC":      (39, 34),
     },
     2024: {
-        # Eastern Conference
-        "Inter Miami CF":         (74, 34),  # Supporters' Shield
+        "Inter Miami CF":         (74, 34),
         "Philadelphia Union":     (65, 34),
         "FC Cincinnati":          (62, 34),
         "New York City FC":       (55, 34),
@@ -142,28 +145,25 @@ HISTORICAL_SEASONS: Dict[int, Dict[str, Tuple[int, int]]] = {
         "D.C. United":            (38, 34),
         "New England Revolution": (37, 34),
         "Toronto FC":             (28, 34),
-        # Western Conference
-        "LA Galaxy":              (63, 34),  # MLS Cup winners
-        "LAFC":                   (63, 34),
-        "Real Salt Lake":         (60, 34),
-        "Colorado Rapids":        (57, 34),
-        "Minnesota United FC":    (54, 34),
+        "LA Galaxy":              (64, 34),
+        "LAFC":                   (64, 34),
+        "Real Salt Lake":         (59, 34),
+        "Colorado Rapids":        (50, 34),
+        "Minnesota United FC":    (52, 34),
         "Seattle Sounders FC":    (53, 34),
-        "Vancouver Whitecaps FC": (50, 34),
-        "Austin FC":              (47, 34),
+        "Vancouver Whitecaps FC": (47, 34),
+        "Austin FC":              (42, 34),
         "Portland Timbers":       (46, 34),
         "FC Dallas":              (45, 34),
         "St. Louis City SC":      (44, 34),
         "Houston Dynamo FC":      (43, 34),
         "Sporting Kansas City":   (39, 34),
         "San Jose Earthquakes":   (37, 34),
-        # San Diego FC debuted in 2025
     },
     2025: {
-        # Eastern Conference
-        "Philadelphia Union":     (66, 34),  # Supporters' Shield
+        "Philadelphia Union":     (66, 34),
         "FC Cincinnati":          (65, 34),
-        "Inter Miami CF":         (65, 34),  # MLS Cup winners
+        "Inter Miami CF":         (65, 34),
         "Charlotte FC":           (59, 34),
         "New York City FC":       (56, 34),
         "Nashville SC":           (54, 34),
@@ -176,23 +176,63 @@ HISTORICAL_SEASONS: Dict[int, Dict[str, Tuple[int, int]]] = {
         "CF Montréal":            (28, 34),
         "Atlanta United FC":      (28, 34),
         "D.C. United":            (26, 34),
-        # Western Conference
-        "San Diego FC":           (70, 34),  # Conference leaders, debut season
-        "Vancouver Whitecaps FC": (63, 34),  # MLS Cup finalists
+        "San Diego FC":           (63, 34),
+        "Vancouver Whitecaps FC": (63, 34),
         "LAFC":                   (60, 34),
         "Minnesota United FC":    (58, 34),
         "Seattle Sounders FC":    (55, 34),
-        "Austin FC":              (52, 34),
-        "LA Galaxy":              (50, 34),
+        "Austin FC":              (47, 34),
         "FC Dallas":              (44, 34),
         "Portland Timbers":       (44, 34),
         "Real Salt Lake":         (41, 34),
         "San Jose Earthquakes":   (41, 34),
         "Colorado Rapids":        (41, 34),
-        "St. Louis City SC":      (35, 34),
-        "Sporting Kansas City":   (33, 34),
-        "Houston Dynamo FC":      (31, 34),
+        "St. Louis City SC":      (32, 34),
+        "LA Galaxy":              (30, 34),
+        "Sporting Kansas City":   (28, 34),
+        "Houston Dynamo FC":      (37, 34),
     },
+}
+
+
+# ─────────────────────────────────────────────────────────────
+#  2025 Goals Data (for Poisson goal model)
+#  Format: team -> (goals_for, goals_against, games_played)
+# ─────────────────────────────────────────────────────────────
+
+GOALS_2025: Dict[str, Tuple[int, int, int]] = {
+    # Eastern Conference
+    "Philadelphia Union":     (57, 35, 34),
+    "FC Cincinnati":          (52, 40, 34),
+    "Inter Miami CF":         (81, 55, 34),
+    "Charlotte FC":           (55, 46, 34),
+    "New York City FC":       (50, 44, 34),
+    "Nashville SC":           (58, 45, 34),
+    "Columbus Crew":          (55, 51, 34),
+    "Chicago Fire FC":        (68, 60, 34),
+    "Orlando City SC":        (63, 51, 34),
+    "New York Red Bulls":     (48, 47, 34),
+    "New England Revolution": (44, 51, 34),
+    "Toronto FC":             (37, 44, 34),
+    "CF Montréal":            (34, 60, 34),
+    "Atlanta United FC":      (38, 63, 34),
+    "D.C. United":            (30, 66, 34),
+    # Western Conference
+    "San Diego FC":           (64, 41, 34),
+    "Vancouver Whitecaps FC": (66, 38, 34),
+    "LAFC":                   (65, 40, 34),
+    "Minnesota United FC":    (56, 39, 34),
+    "Seattle Sounders FC":    (58, 48, 34),
+    "Austin FC":              (37, 45, 34),
+    "FC Dallas":              (52, 55, 34),
+    "Portland Timbers":       (41, 48, 34),
+    "Real Salt Lake":         (38, 49, 34),
+    "San Jose Earthquakes":   (60, 63, 34),
+    "Colorado Rapids":        (44, 56, 34),
+    "Houston Dynamo FC":      (43, 56, 34),
+    "St. Louis City SC":      (44, 58, 34),
+    "LA Galaxy":              (46, 66, 34),
+    "Sporting Kansas City":   (46, 70, 34),
 }
 
 
@@ -207,6 +247,7 @@ class Fixture:
     kickoff_et: str
     date: str
     broadcast: str = "Apple TV"
+
 
 ROUND_1_FIXTURES: List[Fixture] = [
     # Saturday, February 21 ─────────────────────────────────
@@ -233,38 +274,18 @@ ROUND_1_FIXTURES: List[Fixture] = [
 #  Elo Engine
 # ─────────────────────────────────────────────────────────────
 
-def season_elo_from_points(pts: int, gp: int, league_avg: float = MLS_AVG_POINTS) -> float:
-    """
-    Convert a team's final season points into a season-level Elo score.
-
-    We treat league-average performance as Elo 1500 and scale linearly:
-        season_elo = 1500 + (pts_per_game - avg_ppg) * pts_to_elo_scale * 34
-
-    The '34' normalises for any abbreviated seasons.
-    """
+def season_elo_from_points(pts: int, gp: int) -> float:
     pts_per_game = pts / gp
-    avg_ppg = league_avg / 34.0
+    avg_ppg = MLS_AVG_POINTS / 34.0
     delta = (pts_per_game - avg_ppg) * POINTS_TO_ELO_SCALE * 34.0
     return INITIAL_ELO + delta
 
 
 def build_elo_ratings() -> Dict[str, float]:
-    """
-    Compute 2026 pre-season Elo ratings for every MLS team.
-
-    Algorithm
-    ---------
-    1. For every season, convert each team's points to a 'season Elo'.
-    2. Compute a weighted average across seasons (recent = more weight).
-    3. Apply 30% regression toward 1500 to simulate off-season uncertainty.
-    4. Teams new to the league start at 1480 (slight discount for unknowns)
-       and gain full exposure from their first recorded season onward.
-    """
     all_teams: set = set()
     for season_data in HISTORICAL_SEASONS.values():
         all_teams.update(season_data.keys())
 
-    # Collect weighted Elo per team
     weighted_elo: Dict[str, List[Tuple[float, float]]] = {t: [] for t in all_teams}
     for season, season_data in HISTORICAL_SEASONS.items():
         weight = SEASON_WEIGHTS[season]
@@ -273,80 +294,148 @@ def build_elo_ratings() -> Dict[str, float]:
             weighted_elo[team].append((elo, weight))
 
     ratings: Dict[str, float] = {}
-    for team, elo_weight_pairs in weighted_elo.items():
-        total_weight = sum(w for _, w in elo_weight_pairs)
-        raw_elo = sum(e * w for e, w in elo_weight_pairs) / total_weight
-        # Regression to mean
-        regressed = INITIAL_ELO + (raw_elo - INITIAL_ELO) * (1.0 - REGRESSION_TO_MEAN)
+    for team, pairs in weighted_elo.items():
+        total_weight = sum(w for _, w in pairs)
+        raw = sum(e * w for e, w in pairs) / total_weight
+        regressed = INITIAL_ELO + (raw - INITIAL_ELO) * (1.0 - REGRESSION_TO_MEAN)
         ratings[team] = round(regressed, 1)
-
     return ratings
 
 
 def expected_score(elo_a: float, elo_b: float) -> float:
-    """Standard Elo expected score for player A versus player B."""
     return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / ELO_SCALE))
 
 
 def predict_three_way(
     home_elo: float,
     away_elo: float,
-    home_adv: float = HOME_ADVANTAGE,
-    draw_base: float = DRAW_BASE_RATE,
-    draw_sensitivity: float = DRAW_SENSITIVITY,
 ) -> Tuple[float, float, float]:
-    """
-    Predict home-win / draw / away-win probabilities from Elo ratings.
-
-    Steps
-    -----
-    1. Apply home-field advantage to the home team's rating.
-    2. Compute the raw home-win probability using the Elo formula.
-    3. Estimate draw probability: draws are more likely when teams are
-       evenly matched (raw win probability close to 50 %).
-    4. Scale win/loss probabilities into the remaining probability mass.
-
-    Returns
-    -------
-    (p_home_win, p_draw, p_away_win)  — sums to 1.0
-    """
-    adjusted_home = home_elo + home_adv
-    raw_home_win = expected_score(adjusted_home, away_elo)
-
-    # Draw is highest when raw_home_win ≈ 0.5
-    evenness = 1.0 - abs(raw_home_win - 0.5) * 2.0   # 0 (one-sided) to 1 (even)
-    p_draw = draw_base + draw_sensitivity * evenness
-
+    """Return (p_home_win, p_draw, p_away_win) using Elo + home advantage."""
+    raw_home_win = expected_score(home_elo + HOME_ADVANTAGE, away_elo)
+    evenness = 1.0 - abs(raw_home_win - 0.5) * 2.0
+    p_draw = DRAW_BASE_RATE + DRAW_SENSITIVITY * evenness
     remaining = 1.0 - p_draw
-    p_home_win = raw_home_win * remaining
-    p_away_win = (1.0 - raw_home_win) * remaining
-
-    return p_home_win, p_draw, p_away_win
-
-
-def confidence_label(prob: float) -> str:
-    """Human-readable confidence tier for a win probability."""
-    if prob >= 0.60:
-        return "HIGH"
-    if prob >= 0.45:
-        return "MODERATE"
-    if prob >= 0.35:
-        return "LOW"
-    return "TOSS-UP"
+    return raw_home_win * remaining, p_draw, (1.0 - raw_home_win) * remaining
 
 
 # ─────────────────────────────────────────────────────────────
-#  Prediction Report
+#  Poisson Goal Engine
+# ─────────────────────────────────────────────────────────────
+
+def build_goal_ratings(
+    goals_data: Dict[str, Tuple[int, int, int]],
+    league_avg: float = LEAGUE_AVG_GPG,
+    regression: float = GOAL_REGRESSION,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Compute attack and defense strength ratings from goals data.
+
+    attack[team] > 1.0  → above-average scorer
+    defense[team] > 1.0 → above-average goals conceded (leaky defense)
+
+    A 25 % regression toward 1.0 is applied to account for off-season
+    squad changes and the uncertainty at the start of a new season.
+    """
+    attack: Dict[str, float] = {}
+    defense: Dict[str, float] = {}
+    for team, (gf, ga, gp) in goals_data.items():
+        raw_att = (gf / gp) / league_avg
+        raw_def = (ga / gp) / league_avg
+        attack[team]  = 1.0 + (raw_att - 1.0) * (1.0 - regression)
+        defense[team] = 1.0 + (raw_def - 1.0) * (1.0 - regression)
+    return attack, defense
+
+
+def expected_goals(
+    home: str,
+    away: str,
+    attack: Dict[str, float],
+    defense: Dict[str, float],
+) -> Tuple[float, float]:
+    """
+    Expected goals for each team using the Dixon-Coles multiplicative model.
+
+        λ_home = league_home_avg × home_attack × away_defense_weakness
+        λ_away = league_away_avg × away_attack × home_defense_weakness
+
+    Defaults to league-average strength (1.0) for unknown teams.
+    """
+    h_att  = attack.get(home,  1.0)
+    a_def  = defense.get(away, 1.0)
+    a_att  = attack.get(away,  1.0)
+    h_def  = defense.get(home, 1.0)
+
+    lam_home = LEAGUE_HOME_AVG * h_att * a_def
+    lam_away = LEAGUE_AWAY_AVG * a_att * h_def
+    return round(lam_home, 3), round(lam_away, 3)
+
+
+def p_over_2_5(lam_home: float, lam_away: float) -> float:
+    """
+    Probability that total goals exceed 2.5 (i.e. 3 or more goals).
+
+    Under the independence assumption, total goals T = G_home + G_away
+    follows Poisson(λ_total) where λ_total = λ_home + λ_away.
+
+        P(T ≤ 2) = e^{-λ} × (1 + λ + λ²/2)
+        P(T > 2) = 1 − P(T ≤ 2)
+    """
+    lam = lam_home + lam_away
+    p_le2 = math.exp(-lam) * (1.0 + lam + lam ** 2 / 2.0)
+    return max(0.0, min(1.0, 1.0 - p_le2))
+
+
+def p_exact_score_table(
+    lam_home: float,
+    lam_away: float,
+    max_goals: int = 6,
+) -> Dict[Tuple[int, int], float]:
+    """
+    Return a {(home_goals, away_goals): probability} table.
+    Useful for inspecting the most likely scorelines.
+    """
+    table: Dict[Tuple[int, int], float] = {}
+    for h in range(max_goals + 1):
+        for a in range(max_goals + 1):
+            p = (
+                math.exp(-lam_home) * lam_home ** h / math.factorial(h)
+                * math.exp(-lam_away) * lam_away ** a / math.factorial(a)
+            )
+            table[(h, a)] = p
+    return table
+
+
+def top_scorelines(
+    lam_home: float,
+    lam_away: float,
+    n: int = 5,
+) -> List[Tuple[Tuple[int, int], float]]:
+    """Return the n most probable exact scorelines."""
+    table = p_exact_score_table(lam_home, lam_away)
+    return sorted(table.items(), key=lambda x: x[1], reverse=True)[:n]
+
+
+# ─────────────────────────────────────────────────────────────
+#  Combined Prediction
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
 class MatchPrediction:
     fixture: Fixture
+    # Elo model outputs
     home_elo: float
     away_elo: float
     p_home: float
     p_draw: float
     p_away: float
+    # Goal model outputs
+    xg_home: float
+    xg_away: float
+    p_over25: float
+
+    @property
+    def xg_total(self) -> float:
+        return round(self.xg_home + self.xg_away, 2)
 
     @property
     def predicted_outcome(self) -> str:
@@ -355,125 +444,156 @@ class MatchPrediction:
 
     @property
     def predicted_winner(self) -> str:
-        outcome = self.predicted_outcome
-        if outcome == "Home Win":
+        o = self.predicted_outcome
+        if o == "Home Win":
             return self.fixture.home
-        if outcome == "Away Win":
+        if o == "Away Win":
             return self.fixture.away
         return "Draw"
 
     @property
-    def confidence(self) -> str:
-        max_p = max(self.p_home, self.p_draw, self.p_away)
-        return confidence_label(max_p)
+    def over_under_call(self) -> str:
+        return "OVER 2.5" if self.p_over25 >= 0.50 else "UNDER 2.5"
+
+    @property
+    def ou_confidence(self) -> str:
+        p = self.p_over25 if self.p_over25 >= 0.50 else 1.0 - self.p_over25
+        if p >= 0.70:
+            return "HIGH"
+        if p >= 0.58:
+            return "MODERATE"
+        return "SLIGHT"
 
 
 def run_predictions() -> List[MatchPrediction]:
-    ratings = build_elo_ratings()
+    elo_ratings = build_elo_ratings()
+    attack, defense = build_goal_ratings(GOALS_2025)
     predictions: List[MatchPrediction] = []
 
     for fixture in ROUND_1_FIXTURES:
-        home_elo = ratings.get(fixture.home, INITIAL_ELO)
-        away_elo = ratings.get(fixture.away, INITIAL_ELO)
-        p_home, p_draw, p_away = predict_three_way(home_elo, away_elo)
-        predictions.append(
-            MatchPrediction(
-                fixture=fixture,
-                home_elo=home_elo,
-                away_elo=away_elo,
-                p_home=p_home,
-                p_draw=p_draw,
-                p_away=p_away,
-            )
-        )
+        h_elo = elo_ratings.get(fixture.home, INITIAL_ELO)
+        a_elo = elo_ratings.get(fixture.away, INITIAL_ELO)
+        p_home, p_draw, p_away = predict_three_way(h_elo, a_elo)
+        xg_h, xg_a = expected_goals(fixture.home, fixture.away, attack, defense)
+        p_o25 = p_over_2_5(xg_h, xg_a)
+        predictions.append(MatchPrediction(
+            fixture=fixture,
+            home_elo=h_elo, away_elo=a_elo,
+            p_home=p_home, p_draw=p_draw, p_away=p_away,
+            xg_home=xg_h, xg_away=xg_a,
+            p_over25=p_o25,
+        ))
     return predictions
 
 
-def print_report(predictions: List[MatchPrediction]) -> None:
-    header = "=" * 78
-    divider = "-" * 78
+# ─────────────────────────────────────────────────────────────
+#  Report
+# ─────────────────────────────────────────────────────────────
 
-    print(header)
-    print("  MLS 2026 ROUND 1 — MATCH PREDICTIONS (Opening Weekend)")
-    print("  Model: Elo Ratings | Seasons: 2022-2025 | Updated: Feb 2026")
-    print(header)
+W = 80
+DIV = "─" * W
+HDR = "═" * W
+
+
+def print_report(predictions: List[MatchPrediction]) -> None:
+    print(HDR)
+    print("  MLS 2026 ROUND 1 — PREDICTIONS  |  Opening Weekend Feb 21-22")
+    print("  Models: Elo (result) + Poisson/Dixon-Coles (goals) | Data: 2022-2025")
+    print(HDR)
 
     current_date = ""
     for pred in predictions:
         if pred.fixture.date != current_date:
             current_date = pred.fixture.date
-            day_label = "SATURDAY, FEBRUARY 21" if "21" in current_date else "SUNDAY, FEBRUARY 22"
-            print(f"\n  {day_label}, 2026")
-            print(divider)
+            label = "SATURDAY FEBRUARY 21" if "21" in current_date else "SUNDAY FEBRUARY 22"
+            print(f"\n  ▶  {label}, 2026")
+            print(DIV)
 
-        home = pred.fixture.home
-        away = pred.fixture.away
-        kickoff = pred.fixture.kickoff_et
-        broadcast = pred.fixture.broadcast
+        h, a = pred.fixture.home, pred.fixture.away
+        lam_h, lam_a = pred.xg_home, pred.xg_away
+        scores = top_scorelines(lam_h, lam_a, n=3)
 
-        elo_diff = pred.home_elo - pred.away_elo
-        elo_diff_str = f"+{elo_diff:.0f}" if elo_diff >= 0 else f"{elo_diff:.0f}"
-
-        print(f"\n  {kickoff} ET  |  {broadcast}")
-        print(f"  {home} vs {away}")
-        print(f"  Elo: {pred.home_elo:.0f}  vs  {pred.away_elo:.0f}  (home advantage net: {elo_diff_str})")
+        print(f"\n  {pred.fixture.kickoff_et} ET  ·  {pred.fixture.broadcast}")
+        print(f"  {h}  vs  {a}")
+        print(f"  Elo: {pred.home_elo:.0f} vs {pred.away_elo:.0f}")
         print(
-            f"  Probabilities:  "
-            f"Home {pred.p_home:.1%}  |  "
-            f"Draw {pred.p_draw:.1%}  |  "
-            f"Away {pred.p_away:.1%}"
+            f"  Result:  Home {pred.p_home:.1%}  ·  Draw {pred.p_draw:.1%}"
+            f"  ·  Away {pred.p_away:.1%}  → {pred.predicted_winner}"
         )
         print(
-            f"  Prediction: {pred.predicted_winner:<30s}  "
-            f"[{pred.confidence} confidence]"
+            f"  Goals:   xG {lam_h:.2f} – {lam_a:.2f}  (total {pred.xg_total:.2f})"
+            f"  →  Over 2.5: {pred.p_over25:.1%}  [{pred.ou_confidence} {pred.over_under_call}]"
         )
+        score_str = "  ".join(f"{s[0]}-{s[1]} ({p:.1%})" for (s, p) in scores)
+        print(f"  Top scorelines: {score_str}")
 
-    print(f"\n{divider}")
-    print("  SUMMARY — PREDICTED WINNERS")
-    print(divider)
-    print(f"  {'Match':<46} {'Outcome':<14} {'Prob':>6}")
-    print(f"  {'-'*46} {'-'*14} {'-'*6}")
+    # ── Summary table ──────────────────────────────────────────────────────────
+    print(f"\n{HDR}")
+    print("  OVER / UNDER 2.5 GOALS SUMMARY — ALL 15 MATCHES")
+    print(HDR)
+    print(f"  {'Match':<46} {'xG':>6}  {'P(O2.5)':>8}  {'Call':<12}  Confidence")
+    print(f"  {'─'*46}  {'─'*6}  {'─'*8}  {'─'*12}  {'─'*8}")
     for pred in predictions:
         matchup = f"{pred.fixture.home} vs {pred.fixture.away}"
         if len(matchup) > 44:
             matchup = matchup[:44]
-        outcome = pred.predicted_winner
-        if outcome == "Draw":
-            best_prob = pred.p_draw
-        elif outcome == pred.fixture.home:
-            best_prob = pred.p_home
-        else:
-            best_prob = pred.p_away
-        print(f"  {matchup:<46} {outcome:<14} {best_prob:>5.1%}")
+        call_str = "OVER ✓" if pred.over_under_call == "OVER 2.5" else "UNDER ✗"
+        print(
+            f"  {matchup:<46}  {pred.xg_total:>5.2f}  "
+            f"{pred.p_over25:>7.1%}   {call_str:<12} {pred.ou_confidence}"
+        )
 
-    print(f"\n{divider}")
-    print("  TEAM ELO RATINGS — 2026 PRE-SEASON")
-    print(divider)
+    over_count = sum(1 for p in predictions if p.over_under_call == "OVER 2.5")
+    under_count = len(predictions) - over_count
+    print(f"\n  OVER count: {over_count}  |  UNDER count: {under_count}  (of {len(predictions)} matches)")
 
-    all_teams = {pred.fixture.home for pred in predictions} | {pred.fixture.away for pred in predictions}
-    ratings_subset = {}
-    full_ratings = build_elo_ratings()
-    for team in all_teams:
-        ratings_subset[team] = full_ratings.get(team, INITIAL_ELO)
-    sorted_ratings = sorted(ratings_subset.items(), key=lambda x: x[1], reverse=True)
-    for rank, (team, elo) in enumerate(sorted_ratings, 1):
-        bar_width = int((elo - 1350) / 10)
-        bar = "#" * bar_width
-        print(f"  {rank:>2}. {team:<30s}  {elo:>6.0f}  {bar}")
+    # ── O/U ranked by probability ──────────────────────────────────────────────
+    print(f"\n{DIV}")
+    print("  RANKED BY OVER 2.5 PROBABILITY (highest → lowest)")
+    print(DIV)
+    ranked = sorted(predictions, key=lambda p: p.p_over25, reverse=True)
+    for i, pred in enumerate(ranked, 1):
+        matchup = f"{pred.fixture.home} vs {pred.fixture.away}"
+        bar_len = int(pred.p_over25 * 30)
+        bar = "█" * bar_len + "░" * (30 - bar_len)
+        print(f"  {i:>2}. {matchup:<42} {pred.p_over25:>5.1%}  {bar}")
 
-    print(f"\n{header}")
-    print("  DISCLAIMER")
-    print(
-        "  Predictions are probabilistic estimates based on team performance\n"
-        "  from 2022-2025 regular seasons. They do not account for individual\n"
-        "  match day form, injuries, roster moves, or weather conditions.\n"
-        "  Use alongside qualitative analysis for best results."
+    # ── Elo leaderboard ────────────────────────────────────────────────────────
+    print(f"\n{DIV}")
+    print("  TEAM ELO RATINGS  |  ATTACK ↑ / DEFENSE ↓ STRENGTHS (2025)")
+    print(DIV)
+    attack, defense = build_goal_ratings(GOALS_2025)
+    elo_ratings = build_elo_ratings()
+    all_teams = {p.fixture.home for p in predictions} | {p.fixture.away for p in predictions}
+    table = sorted(
+        [(t, elo_ratings.get(t, 1500.0), attack.get(t, 1.0), defense.get(t, 1.0))
+         for t in all_teams],
+        key=lambda x: x[1], reverse=True
     )
-    print(header)
+    print(f"  {'Team':<32} {'Elo':>5}  {'Att':>5}  {'Def':>5}  (Att>1=good scorer, Def<1=good defender)")
+    print(f"  {'─'*32}  {'─'*5}  {'─'*5}  {'─'*5}")
+    for team, elo, att, def_ in table:
+        att_bar = "▲" if att > 1.05 else ("▼" if att < 0.95 else "─")
+        def_bar = "▼" if def_ < 0.95 else ("▲" if def_ > 1.05 else "─")
+        print(f"  {team:<32} {elo:>5.0f}  {att:>5.2f}{att_bar}  {def_:>5.2f}{def_bar}")
+
+    print(f"\n{HDR}")
+    print("  METHODOLOGY NOTES")
+    print(f"  {'─'*76}")
+    print(
+        "  • Result probabilities: Elo model, seasons 2022-2025 (50/25/15/10 % weights),\n"
+        "    +100 Elo home advantage, 30 % regression to mean between seasons.\n"
+        "  • Over/Under: Independent Poisson (Dixon-Coles style). Attack/defense\n"
+        "    strengths from 2025 GF/GA, regressed 25 % toward league average.\n"
+        "    League home avg 1.60 g/g, away avg 1.30 g/g (2025 MLS: 2.90 g/g).\n"
+        "  • Does NOT factor in: injuries, new signings, weather, referee, or\n"
+        "    preseason form. Use alongside qualitative analysis."
+    )
+    print(HDR)
 
 
 # ─────────────────────────────────────────────────────────────
-#  Main
+#  Entry Point
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
